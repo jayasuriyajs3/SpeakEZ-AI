@@ -1,0 +1,3 @@
+session_id,language,label_confidence,label_notes,fillers_total,fillers_density,wpm,voice_variation,eye_contact,posture
+example_001,en,good,"clear, steady pace",7,0.03,145,0.62,0.78,0.81
+

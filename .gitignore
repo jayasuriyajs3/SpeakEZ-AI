@@ -1,0 +1,14 @@
+node_modules/
+dist/
+.env
+.venv/
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.sqlite
+*.db
+backend/models/*.bin
+backend/models/*.pt
+backend/models/*.onnx
+
