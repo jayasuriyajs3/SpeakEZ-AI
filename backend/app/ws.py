@@ -1,4 +1,5 @@
 import base64
+import asyncio
 import time
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
@@ -13,6 +14,7 @@ router = APIRouter()
 async def ws_session(websocket: WebSocket):
     await websocket.accept()
     session = LiveSession()
+    session_stopped = False
     try:
         while True:
             raw = await websocket.receive_text()
@@ -20,9 +22,10 @@ async def ws_session(websocket: WebSocket):
             if msg.type == "session_start":
                 mode = msg.payload.get("mode") if isinstance(msg.payload, dict) else None
                 language = msg.payload.get("language") if isinstance(msg.payload, dict) else None
-                session.reset(mode=str(mode or "practice"), language=str(language or "en"))
+                await asyncio.to_thread(session.reset, str(mode or "practice"), str(language or "en"))
                 if session.session_id is not None:
-                    append_session_event(
+                    await asyncio.to_thread(
+                        append_session_event,
                         session.session_id,
                         "session_start",
                         {"payload": msg.payload},
@@ -34,9 +37,11 @@ async def ws_session(websocket: WebSocket):
                 continue
 
             if msg.type == "session_stop":
-                summary = session.finalize()
+                summary = await asyncio.to_thread(session.finalize)
+                session_stopped = True
                 if session.session_id is not None:
-                    append_session_event(
+                    await asyncio.to_thread(
+                        append_session_event,
                         session.session_id,
                         "session_stop",
                         {"summary": summary},
@@ -54,36 +59,27 @@ async def ws_session(websocket: WebSocket):
                     continue
                 pcm16 = base64.b64decode(b64)
                 now_ms = int(time.time() * 1000)
-                if session.session_id is not None:
-                    append_session_event(
-                        session.session_id,
-                        "audio_chunk",
-                        {
-                            "sample_rate_hz": sample_rate,
-                            "bytes": len(pcm16),
-                            "at_ms": now_ms,
-                        },
-                    )
-                out_events = session.ingest_audio_pcm16(pcm16=pcm16, sample_rate_hz=sample_rate, now_ms=now_ms)
+                out_events = await asyncio.to_thread(
+                    session.ingest_audio_pcm16,
+                    pcm16,
+                    sample_rate,
+                    now_ms,
+                )
                 for ev in out_events:
-                    if session.session_id is not None and ev.type in ("realtime_metrics", "transcript_partial"):
-                        append_session_event(
-                            session.session_id,
-                            ev.type,
-                            ev.payload,
-                        )
                     await websocket.send_text(ev.model_dump_json())
+                continue
+
+            if msg.type == "transcript_update":
+                transcript = str(msg.payload.get("text", "") or "")
+                await asyncio.to_thread(session.ingest_transcript_text, transcript)
+                await websocket.send_text(
+                    ServerMessage(type="ack", payload={"received_type": msg.type}).model_dump_json()
+                )
                 continue
 
             if msg.type in ("video_landmarks", "video_frame"):
                 if msg.type == "video_landmarks":
-                    session.ingest_video_metrics(msg.payload)
-                    if session.session_id is not None:
-                        append_session_event(
-                            session.session_id,
-                            "video_landmarks",
-                            msg.payload,
-                        )
+                    await asyncio.to_thread(session.ingest_video_metrics, msg.payload)
                 await websocket.send_text(
                     ServerMessage(type="ack", payload={"received_type": msg.type}).model_dump_json()
                 )
@@ -93,5 +89,13 @@ async def ws_session(websocket: WebSocket):
                 ServerMessage(type="error", payload={"message": f"unsupported message type: {msg.type}"}).model_dump_json()
             )
     except WebSocketDisconnect:
+        if session.session_id is not None and not session_stopped:
+            summary = await asyncio.to_thread(session.finalize)
+            await asyncio.to_thread(
+                append_session_event,
+                session.session_id,
+                "session_stop_disconnect",
+                {"summary": summary},
+            )
         return
 

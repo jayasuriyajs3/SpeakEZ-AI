@@ -41,11 +41,13 @@ class LiveSession:
     voice_variation: float = 0.0
     history: list[dict] = field(default_factory=list)
     session_id: int | None = None
+    prefer_frontend_transcript: bool = False
     _ema_eye: float = 0.0
     _ema_posture: float = 0.0
     _ema_voice: float = 0.0
     _confidence_model: ConfidenceModel = field(default_factory=lambda: ConfidenceModel(DEFAULT_MODEL_PATH))
     _confidence_loaded: bool = False
+    _finalized: bool = False
 
     def reset(self, mode: str = "practice", language: str = "en") -> None:
         self.pcm16.clear()
@@ -57,10 +59,12 @@ class LiveSession:
         self.posture = 0.0
         self.emotion = "neutral"
         self.voice_variation = 0.0
+        self.prefer_frontend_transcript = False
         self.history.clear()
         self._ema_eye = 0.0
         self._ema_posture = 0.0
         self._ema_voice = 0.0
+        self._finalized = False
         if not self._confidence_loaded:
             try:
                 self._confidence_loaded = self._confidence_model.try_load()
@@ -100,9 +104,9 @@ class LiveSession:
         tail = bytes(self.pcm16[-tail_bytes:]) if len(self.pcm16) > tail_bytes else bytes(self.pcm16)
         continuity = self.audio.vad_speech_ratio(tail, self.sample_rate_hz)
 
-        # Transcribe incrementally every ~2.5 seconds (on speech).
-        if self.last_transcribe_ms == 0 or (now_ms - self.last_transcribe_ms) >= 2500:
-            if continuity >= 0.15 and len(self.pcm16) > self.last_transcribed_bytes + int(self.sample_rate_hz * 0.5) * 2:
+        # Transcribe incrementally every ~1.5 seconds (on speech).
+        if not self.prefer_frontend_transcript and (self.last_transcribe_ms == 0 or (now_ms - self.last_transcribe_ms) >= 1500):
+            if continuity >= 0.05 and len(self.pcm16) > self.last_transcribed_bytes + int(self.sample_rate_hz * 0.4) * 2:
                 # Overlap 0.5s to reduce word cut-offs.
                 overlap_bytes = int(self.sample_rate_hz * 0.5) * 2
                 start = max(0, self.last_transcribed_bytes - overlap_bytes)
@@ -111,7 +115,7 @@ class LiveSession:
                 try:
                     new_text = self.audio.transcribe_incremental(a, self.sample_rate_hz, self.language)
                 except Exception as e:
-                    out.append(ServerMessage(type="error", payload={"message": f"stt_failed: {e.__class__.__name__}"}))
+                    out.append(ServerMessage(type="error", payload={"message": f"stt_failed: {e.__class__.__name__}: {e}"}))
                     new_text = ""
                 if new_text:
                     new_text = new_text.strip()
@@ -140,32 +144,7 @@ class LiveSession:
             if len(self.history) > 600:
                 self.history = self.history[-600:]
 
-            # Heuristic confidence score (trainable model hooks come later).
-            # Penalize fillers + too-fast/slow pace + low continuity.
-            pace_pen = 0.0
-            if m.wpm < 110:
-                pace_pen = min(25.0, (110 - m.wpm) * 0.25)
-            elif m.wpm > 170:
-                pace_pen = min(25.0, (m.wpm - 170) * 0.25)
-            filler_pen = min(35.0, m.fillers_density * 700.0)  # 0.05 -> 35
-            cont_pen = min(25.0, (1.0 - m.continuity) * 25.0)
-            confidence = float(max(0.0, min(100.0, 100.0 - pace_pen - filler_pen - cont_pen)))
-            if self._confidence_loaded:
-                try:
-                    pred = self._confidence_model.predict_score_0_100(
-                        ConfidenceFeatures(
-                            wpm=float(m.wpm),
-                            fillers_density=float(m.fillers_density),
-                            continuity=float(m.continuity),
-                            eye_contact=float(self.eye_contact),
-                            posture=float(self.posture),
-                            voice_variation=float(self.voice_variation),
-                        )
-                    )
-                    if pred is not None:
-                        confidence = float(max(0.0, min(100.0, pred)))
-                except Exception:
-                    pass
+            confidence = self._estimate_confidence(m.wpm, m.fillers_density, m.continuity)
 
             out.append(
                 ServerMessage(
@@ -204,13 +183,125 @@ class LiveSession:
         return out
 
     def finalize(self) -> dict:
+        if self._finalized:
+            return {"session_id": self.session_id, "transcript": self.transcript}
+
+        # Final transcription pass to capture the tail of audio even when periodic ticks miss it.
+        min_new_bytes = int(self.sample_rate_hz * 0.2) * 2
+        if not self.prefer_frontend_transcript and len(self.pcm16) > self.last_transcribed_bytes + min_new_bytes:
+            overlap_bytes = int(self.sample_rate_hz * 0.5) * 2
+            start = max(0, self.last_transcribed_bytes - overlap_bytes)
+            segment_pcm16 = bytes(self.pcm16[start:])
+            a = np.frombuffer(segment_pcm16, dtype=np.int16).astype(np.float32) / 32768.0
+            try:
+                new_text = self.audio.transcribe_incremental(a, self.sample_rate_hz, self.language)
+            except Exception:
+                new_text = ""
+            if new_text:
+                new_text = new_text.strip()
+                if not self.transcript or not self.transcript.endswith(new_text):
+                    self.transcript = (self.transcript + " " + new_text).strip() if self.transcript else new_text
+            self.last_transcribed_bytes = len(self.pcm16)
+
+        # If transcript is still empty, do one full-buffer pass as a last resort.
+        if not self.transcript and len(self.pcm16) > int(self.sample_rate_hz * 1.0) * 2:
+            full_a = np.frombuffer(bytes(self.pcm16), dtype=np.int16).astype(np.float32) / 32768.0
+            try:
+                full_text = self.audio.transcribe_incremental(full_a, self.sample_rate_hz, self.language)
+            except Exception:
+                full_text = ""
+            full_text = (full_text or "").strip()
+            if full_text:
+                self.transcript = full_text
+
+        # Persist one final metric snapshot so reports/PDF use the latest values.
+        duration_s = len(self.pcm16) / 2 / float(max(1, self.sample_rate_hz))
+        t_ms = int(duration_s * 1000)
+        tail_ms = 3000
+        tail_bytes = int(self.sample_rate_hz * (tail_ms / 1000.0) * 2)
+        tail = bytes(self.pcm16[-tail_bytes:]) if len(self.pcm16) > tail_bytes else bytes(self.pcm16)
+        continuity = self.audio.vad_speech_ratio(tail, self.sample_rate_hz)
+        m = self.audio.compute_metrics(self.transcript, t_ms=t_ms, continuity=continuity)
+        self.history.append({"t_ms": t_ms, "wpm": m.wpm, "fillers_density": m.fillers_density})
+        confidence = self._estimate_confidence(m.wpm, m.fillers_density, m.continuity)
+        final_payload = {
+            "t_ms": t_ms,
+            "wpm": round(m.wpm, 1),
+            "wpm_label": m.wpm_label,
+            "fillers_total": m.fillers_total,
+            "fillers_density": round(m.fillers_density, 4),
+            "fillers_by_type": m.fillers_by_type,
+            "continuity": round(m.continuity, 3),
+            "confidence": round(confidence, 1),
+            "confidence_label": (
+                "beginner"
+                if confidence < 55
+                else "average"
+                if confidence < 70
+                else "good"
+                if confidence < 85
+                else "excellent"
+            ),
+            "suggestions": suggestions_for(m.wpm, m.fillers_density, m.continuity),
+            "insights": generate_insights(self.history, m.fillers_by_type),
+            "emotion": self.emotion,
+            "eye_contact": round(float(self.eye_contact), 3),
+            "posture": round(float(self.posture), 3),
+            "voice_variation": round(float(self.voice_variation), 3),
+        }
+        if self.session_id is not None:
+            add_metric_point(self.session_id, final_payload)
+
         summary = {
             "transcript_len": len(self.transcript),
-            "last_metrics": self.history[-1] if self.history else None,
+            "last_metrics": {
+                "t_ms": t_ms,
+                "wpm": final_payload["wpm"],
+                "fillers_total": final_payload["fillers_total"],
+                "fillers_density": final_payload["fillers_density"],
+                "confidence": final_payload["confidence"],
+                "continuity": final_payload["continuity"],
+            },
         }
         if self.session_id is not None:
             finalize_session(self.session_id, transcript=self.transcript, summary=summary)
+        self._finalized = True
         return {"session_id": self.session_id, "transcript": self.transcript}
+
+    def ingest_transcript_text(self, text: str) -> None:
+        cleaned = (text or "").strip()
+        if not cleaned:
+            return
+        self.prefer_frontend_transcript = True
+        self.transcript = cleaned
+
+    def _estimate_confidence(self, wpm: float, fillers_density: float, continuity: float) -> float:
+        # Heuristic confidence score (trainable model hooks come later).
+        pace_pen = 0.0
+        if wpm < 110:
+            pace_pen = min(25.0, (110 - wpm) * 0.25)
+        elif wpm > 170:
+            pace_pen = min(25.0, (wpm - 170) * 0.25)
+        filler_pen = min(35.0, fillers_density * 700.0)  # 0.05 -> 35
+        cont_pen = min(25.0, (1.0 - continuity) * 25.0)
+        confidence = float(max(0.0, min(100.0, 100.0 - pace_pen - filler_pen - cont_pen)))
+        if self._confidence_loaded:
+            try:
+                pred = self._confidence_model.predict_score_0_100(
+                    ConfidenceFeatures(
+                        wpm=float(wpm),
+                        fillers_density=float(fillers_density),
+                        continuity=float(continuity),
+                        eye_contact=float(self.eye_contact),
+                        posture=float(self.posture),
+                        voice_variation=float(self.voice_variation),
+                    )
+                )
+                if pred is not None:
+                    confidence = float(max(0.0, min(100.0, pred)))
+            except Exception:
+                pass
+        return confidence
 
     def _pcm16_to_wav_bytes(self) -> bytes:
         buf = io.BytesIO()

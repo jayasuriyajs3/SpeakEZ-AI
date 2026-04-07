@@ -9,6 +9,7 @@ ClientMessageType = Literal[
     "session_start",
     "session_stop",
     "audio_chunk",
+    "transcript_update",
     "video_landmarks",
     "video_frame",
 ]

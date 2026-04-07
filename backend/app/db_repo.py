@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 
 from sqlmodel import Session as DBSession, select
 
@@ -72,7 +72,7 @@ def create_session(language: str = "en", mode: str = "practice") -> SessionRecor
     if _use_mongodb():
         db = get_mongo_db()
         sid = get_next_sequence("sessions")
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         db.sessions.insert_one(
             {
                 "id": sid,
@@ -132,7 +132,7 @@ def add_metric_point(session_id: int, p: dict) -> None:
                 "eye_contact": float(p.get("eye_contact", 0) or 0),
                 "posture": float(p.get("posture", 0) or 0),
                 "voice_variation": float(p.get("voice_variation", 0) or 0),
-                "created_at": datetime.utcnow(),
+                "created_at": datetime.now(timezone.utc),
             }
         )
         return
@@ -157,18 +157,19 @@ def add_metric_point(session_id: int, p: dict) -> None:
 def finalize_session(session_id: int, transcript: str, summary: dict) -> None:
     if _use_mongodb():
         db = get_mongo_db()
+        now = datetime.now(timezone.utc)
         db.sessions.update_one(
             {"id": int(session_id)},
             {
                 "$set": {
-                    "ended_at": datetime.utcnow(),
+                    "ended_at": now,
                     "transcript": transcript,
                     "summary": summary,
                 },
                 "$push": {
                     "events": {
                         "type": "session_finalized",
-                        "at": datetime.utcnow(),
+                        "at": now,
                         "payload": {"summary": summary, "transcript_len": len(transcript or "")},
                     }
                 },
@@ -188,7 +189,19 @@ def finalize_session(session_id: int, transcript: str, summary: dict) -> None:
 def list_sessions(limit: int = 50) -> list[SessionRecord]:
     if _use_mongodb():
         db = get_mongo_db()
-        rows = db.sessions.find({}, {"_id": 0}).sort("started_at", -1).limit(limit)
+        rows = db.sessions.find(
+            {},
+            {
+                "_id": 0,
+                "id": 1,
+                "started_at": 1,
+                "ended_at": 1,
+                "language": 1,
+                "mode": 1,
+                "transcript": 1,
+                "summary": 1,
+            },
+        ).sort("started_at", -1).limit(limit)
         return [_session_doc_to_record(r) for r in rows]
 
     with DBSession(engine) as db:
@@ -210,7 +223,19 @@ def list_sessions(limit: int = 50) -> list[SessionRecord]:
 def get_session(session_id: int) -> SessionRecord:
     if _use_mongodb():
         db = get_mongo_db()
-        row = db.sessions.find_one({"id": int(session_id)}, {"_id": 0})
+        row = db.sessions.find_one(
+            {"id": int(session_id)},
+            {
+                "_id": 0,
+                "id": 1,
+                "started_at": 1,
+                "ended_at": 1,
+                "language": 1,
+                "mode": 1,
+                "transcript": 1,
+                "summary": 1,
+            },
+        )
         if not row:
             raise ValueError(f"session {session_id} not found")
         return _session_doc_to_record(row)
@@ -264,7 +289,7 @@ def append_session_event(session_id: int, event_type: str, payload: dict | None 
             "$push": {
                 "events": {
                     "type": event_type,
-                    "at": datetime.utcnow(),
+                    "at": datetime.now(timezone.utc),
                     "payload": payload or {},
                 }
             }

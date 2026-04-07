@@ -1,0 +1,3 @@
+audio_path,label
+training/datasets/voice/clips/sample_001.wav,expressive
+training/datasets/voice/clips/sample_002.wav,monotone

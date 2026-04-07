@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Mic, MicOff, Timer } from "lucide-react";
 import { startAudioCapture, type AudioCaptureController } from "@/lib/audioCapture";
+import { isSpeechRecognitionSupported, startSpeechRecognition, type SpeechRecognitionController } from "@/lib/speechRecognition";
 import { TranscriptHighlighter } from "@/components/TranscriptHighlighter";
 
 type Question = { id: string; category: string; difficulty: string; text: string };
@@ -14,9 +15,11 @@ export function Interview() {
   const [timerSec, setTimerSec] = useState(180);
   const [running, setRunning] = useState(false);
   const [score, setScore] = useState<any>(null);
+  const [errorText, setErrorText] = useState("");
 
   const wsRef = useRef<WebSocket | null>(null);
   const audioRef = useRef<AudioCaptureController | null>(null);
+  const speechRef = useRef<SpeechRecognitionController | null>(null);
 
   const wsUrl = useMemo(() => "ws://localhost:8000/ws/session", []);
 
@@ -76,6 +79,22 @@ export function Interview() {
         ws.send(JSON.stringify({ type: "audio_chunk", payload: chunk }));
       }
     });
+
+    speechRef.current?.stop();
+    speechRef.current = await startSpeechRecognition({
+      language: "en-US",
+      onTranscript: (text) => {
+        setTranscript(text);
+        const ws = wsRef.current;
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: "transcript_update", payload: { text } }));
+        }
+      },
+      onError: (message) => setErrorText(`speech_recognition: ${message}`)
+    });
+    if (!speechRef.current && !isSpeechRecognitionSupported()) {
+      setErrorText("speech_recognition: not supported in this browser/profile")
+    }
   }
 
   async function stop() {
@@ -83,6 +102,8 @@ export function Interview() {
     setMicOn(false);
     audioRef.current?.stop();
     audioRef.current = null;
+    speechRef.current?.stop();
+    speechRef.current = null;
     const ws = wsRef.current;
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ type: "session_stop", payload: {} }));
@@ -185,6 +206,7 @@ export function Interview() {
       <div className="grid gap-4 md:grid-cols-2">
         <div className="rounded-2xl border border-border/60 bg-card p-6">
           <div className="text-sm font-medium">Your answer (live)</div>
+          {errorText ? <div className="mt-2 text-xs text-red-300">{errorText}</div> : null}
           <div className="mt-3 text-sm text-muted-foreground">
             <TranscriptHighlighter text={transcript} />
           </div>

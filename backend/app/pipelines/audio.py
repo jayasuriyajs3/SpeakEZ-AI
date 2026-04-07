@@ -76,8 +76,10 @@ class AudioPipeline:
 
     def _get_model(self) -> WhisperModel:
         if self._model is None:
-            device = None if settings.whisper_device == "auto" else settings.whisper_device
-            self._model = WhisperModel(settings.whisper_model, device=device, compute_type="int8")
+            if settings.whisper_device == "auto":
+                self._model = WhisperModel(settings.whisper_model, compute_type="int8")
+            else:
+                self._model = WhisperModel(settings.whisper_model, device=settings.whisper_device, compute_type="int8")
         return self._model
 
     def vad_speech_ratio(self, pcm16: bytes, sample_rate_hz: int) -> float:
@@ -106,17 +108,36 @@ class AudioPipeline:
         language: str | None,
     ) -> str:
         model = self._get_model()
-        segments, _info = model.transcribe(
-            audio_f32,
-            language=language,
-            vad_filter=True,
-            vad_parameters={"min_silence_duration_ms": 250},
+        audio = np.ascontiguousarray(audio_f32, dtype=np.float32)
+        if audio.size < max(1024, int(sample_rate_hz * 0.75)):
+            return ""
+
+        attempts = (
+            {"vad_filter": True, "vad_parameters": {"min_silence_duration_ms": 250}},
+            {"vad_filter": False},
         )
-        parts: list[str] = []
-        for s in segments:
-            if s.text:
-                parts.append(s.text.strip())
-        return " ".join(parts).strip()
+
+        last_error: Exception | None = None
+        for attempt in attempts:
+            try:
+                segments, _info = model.transcribe(
+                    audio,
+                    language=language,
+                    condition_on_previous_text=False,
+                    beam_size=1,
+                    **attempt,
+                )
+                parts: list[str] = []
+                for s in segments:
+                    if s.text:
+                        parts.append(s.text.strip())
+                return " ".join(parts).strip()
+            except Exception as exc:
+                last_error = exc
+
+        if last_error is not None:
+            raise last_error
+        return ""
 
     def compute_metrics(self, transcript: str, t_ms: int, continuity: float) -> AudioMetrics:
         tokens = tokenize_words(transcript)

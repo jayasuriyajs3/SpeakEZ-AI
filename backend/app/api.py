@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+from datetime import datetime, timezone
 
 from fastapi import APIRouter
 from fastapi.responses import StreamingResponse
@@ -15,14 +16,30 @@ from app.interview.scoring import score_content, score_overall
 router = APIRouter(prefix="/api")
 
 
+def _to_iso_utc(dt: datetime | None) -> str | None:
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _to_local_text(dt: datetime | None) -> str:
+    if dt is None:
+        return "—"
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+
+
 @router.get("/sessions")
 def sessions():
     rows = list_sessions()
     return [
         {
             "id": s.id,
-            "started_at": s.started_at,
-            "ended_at": s.ended_at,
+            "started_at": _to_iso_utc(s.started_at),
+            "ended_at": _to_iso_utc(s.ended_at),
             "language": s.language,
             "mode": s.mode,
         }
@@ -37,8 +54,8 @@ def session_detail(session_id: int):
     events = get_session_events(session_id, limit=5000)
     return {
         "id": s.id,
-        "started_at": s.started_at,
-        "ended_at": s.ended_at,
+        "started_at": _to_iso_utc(s.started_at),
+        "ended_at": _to_iso_utc(s.ended_at),
         "language": s.language,
         "mode": s.mode,
         "transcript": s.transcript,
@@ -91,7 +108,7 @@ def session_pdf(session_id: int):
     y -= 28
 
     c.setFont("Helvetica", 10)
-    c.drawString(48, y, f"Started: {s.started_at}   Ended: {s.ended_at or '—'}   Lang: {s.language}")
+    c.drawString(48, y, f"Started: {_to_local_text(s.started_at)}   Ended: {_to_local_text(s.ended_at)}   Lang: {s.language}")
     y -= 20
 
     if last:

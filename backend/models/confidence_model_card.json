@@ -1,0 +1,12 @@
+{
+  "model": "confidence_model.joblib",
+  "source": "training/datasets/confidence/confidence_synthetic_15000.csv",
+  "rows": 15000,
+  "labels": [
+    "poor",
+    "average",
+    "good"
+  ],
+  "accuracy": 0.9586666666666667,
+  "note": "Synthetic bootstrap dataset; replace/augment with real labeled sessions for production quality."
+}

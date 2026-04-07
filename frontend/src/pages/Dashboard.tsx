@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { motion } from "framer-motion";
 import { AlertCircle, Mic, MicOff, Video, VideoOff } from "lucide-react";
 import { startAudioCapture, type AudioCaptureController } from "@/lib/audioCapture";
+import { isSpeechRecognitionSupported, startSpeechRecognition, type SpeechRecognitionController } from "@/lib/speechRecognition";
 import { startVision, type VisionMetrics } from "@/lib/vision";
 import { TranscriptHighlighter } from "@/components/TranscriptHighlighter";
 import { Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
@@ -18,8 +19,11 @@ export function Dashboard() {
   const [level, setLevel] = useState(0);
   const [camOn, setCamOn] = useState(false);
   const [vision, setVision] = useState<VisionMetrics | null>(null);
+  const [errorText, setErrorText] = useState<string>("");
   const wsRef = useRef<WebSocket | null>(null);
+  const sessionActiveRef = useRef(false);
   const audioRef = useRef<AudioCaptureController | null>(null);
+  const speechRef = useRef<SpeechRecognitionController | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const visionRef = useRef<{ stop: () => void } | null>(null);
 
@@ -30,29 +34,68 @@ export function Dashboard() {
 
   useEffect(() => {
     return () => {
+      const ws = wsRef.current;
+      if (ws && ws.readyState === WebSocket.OPEN && sessionActiveRef.current) {
+        ws.send(JSON.stringify({ type: "session_stop", payload: {} }));
+      }
       audioRef.current?.stop();
       audioRef.current = null;
+      speechRef.current?.stop();
+      speechRef.current = null;
       visionRef.current?.stop();
       visionRef.current = null;
       wsRef.current?.close();
       wsRef.current = null;
+      sessionActiveRef.current = false;
     };
   }, []);
 
-  function connect() {
+  async function ensureConnected(): Promise<WebSocket> {
+    const existing = wsRef.current;
+    if (existing && existing.readyState === WebSocket.OPEN) {
+      return existing;
+    }
+
+    if (existing && existing.readyState === WebSocket.CONNECTING) {
+      return await new Promise<WebSocket>((resolve, reject) => {
+        const onOpen = () => {
+          existing.removeEventListener("open", onOpen);
+          existing.removeEventListener("error", onErr);
+          resolve(existing);
+        };
+        const onErr = () => {
+          existing.removeEventListener("open", onOpen);
+          existing.removeEventListener("error", onErr);
+          reject(new Error("websocket_connect_failed"));
+        };
+        existing.addEventListener("open", onOpen, { once: true });
+        existing.addEventListener("error", onErr, { once: true });
+      });
+    }
+
     if (wsRef.current) wsRef.current.close();
     setWsState("connecting");
-    const ws = new WebSocket(wsUrl);
-    wsRef.current = ws;
-    ws.onopen = () => {
-      setWsState("connected");
-      ws.send(JSON.stringify({ type: "session_start", payload: { startedAt: Date.now() } }));
-    };
+    return await new Promise<WebSocket>((resolve, reject) => {
+      const ws = new WebSocket(wsUrl);
+      wsRef.current = ws;
+      ws.onopen = () => {
+        setWsState("connected");
+        setErrorText("");
+        resolve(ws);
+      };
     ws.onmessage = (ev) => {
       try {
         const msg = JSON.parse(ev.data) as { type: string; payload: any };
         if (msg.type === "ack") setLastAck(msg.payload?.received_type ?? "");
         if (msg.type === "transcript_partial") setTranscript(msg.payload?.text ?? "");
+        if (msg.type === "transcript_final") setTranscript(msg.payload?.text ?? "");
+        if (msg.type === "error") setErrorText(msg.payload?.message ?? "Unknown websocket error");
+        if (msg.type === "session_saved") {
+          if (msg.payload?.transcript) setTranscript(msg.payload.transcript);
+          sessionActiveRef.current = false;
+          ws.close();
+          setWsState("disconnected");
+        }
         if (msg.type === "realtime_metrics") {
           setMetrics(msg.payload ?? null);
           const p = msg.payload ?? {};
@@ -66,11 +109,23 @@ export function Dashboard() {
       }
     };
     ws.onclose = () => setWsState("disconnected");
-    ws.onerror = () => setWsState("disconnected");
+      ws.onerror = () => {
+        setWsState("disconnected");
+        reject(new Error("websocket_connect_failed"));
+      };
+    });
+  }
+
+  function connect() {
+    void ensureConnected();
   }
 
   async function startMic() {
-    if (!wsRef.current || wsState !== "connected") connect();
+    const ws = await ensureConnected();
+    if (!sessionActiveRef.current && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: "session_start", payload: { mode: "practice", startedAt: Date.now() } }));
+      sessionActiveRef.current = true;
+    }
     setMicOn(true);
     audioRef.current?.stop();
     audioRef.current = await startAudioCapture({
@@ -83,17 +138,40 @@ export function Dashboard() {
         ws.send(JSON.stringify({ type: "audio_chunk", payload: chunk }));
       }
     });
+
+    speechRef.current?.stop();
+    speechRef.current = await startSpeechRecognition({
+      language: "en-US",
+      onTranscript: (text) => {
+        setTranscript(text);
+        const ws = wsRef.current;
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: "transcript_update", payload: { text } }));
+        }
+      },
+      onError: (message) => setErrorText(`speech_recognition: ${message}`)
+    });
+    if (!speechRef.current && !isSpeechRecognitionSupported()) {
+      setErrorText("speech_recognition: not supported in this browser/profile")
+    }
   }
 
   function stopMic() {
     setMicOn(false);
     audioRef.current?.stop();
     audioRef.current = null;
+    speechRef.current?.stop();
+    speechRef.current = null;
+
+    const ws = wsRef.current;
+    if (ws && ws.readyState === WebSocket.OPEN && sessionActiveRef.current) {
+      ws.send(JSON.stringify({ type: "session_stop", payload: {} }));
+    }
   }
 
   async function startCam() {
     if (!videoRef.current) return;
-    if (!wsRef.current || wsState !== "connected") connect();
+    await ensureConnected();
     setCamOn(true);
     visionRef.current?.stop();
     visionRef.current = await startVision({
@@ -184,6 +262,12 @@ export function Dashboard() {
         <Metric title="WPM" value={metrics?.wpm?.toString?.() ?? "—"} detail={metrics?.wpm_label ?? "—"} />
         <Metric title="Confidence" value={metrics?.confidence?.toString?.() ?? "—"} detail={metrics?.confidence_label ?? "—"} />
       </div>
+
+      {errorText ? (
+        <div className="rounded-2xl border border-red-500/40 bg-red-500/10 p-4 text-sm text-red-200">
+          Backend error: {errorText}
+        </div>
+      ) : null}
 
       <div className="grid gap-4 md:grid-cols-2">
         <div className="rounded-2xl border border-border/60 bg-card p-6">

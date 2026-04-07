@@ -1,10 +1,14 @@
 from pydantic_settings import BaseSettings
+from pathlib import Path
+
+
+BASE_DIR = Path(__file__).resolve().parents[1]
 
 
 class Settings(BaseSettings):
     cors_allow_origins: list[str] = ["http://localhost:5173"]
     storage_backend: str = "sqlite"  # sqlite|mongodb
-    database_url: str = "sqlite:///./speakez.sqlite"
+    database_url: str = f"sqlite:///{(BASE_DIR / 'speakez.sqlite').as_posix()}"
     mongodb_uri: str = "mongodb://localhost:27017"
     mongodb_database: str = "speakez"
 
@@ -15,7 +19,7 @@ class Settings(BaseSettings):
     whisper_device: str = "auto"  # auto|cpu|cuda
 
     class Config:
-        env_file = ".env"
+        env_file = str(BASE_DIR / ".env")
         extra = "ignore"
 
 
