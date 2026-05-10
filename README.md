@@ -70,3 +70,8 @@ Stored collections:
 ## Notes
 - This repo includes **training notebooks + dataset templates** in `training/` to demonstrate fine-tuning/validation beyond pretrained models.
 
+## Render backend deploy
+- Use the root [render.yaml](render.yaml) blueprint for the backend service.
+- Render is pinned to Python 3.12.4 through [backend/runtime.txt](backend/runtime.txt) to avoid SciPy/ML wheel build issues.
+- Backend service root is `backend/`, build command is `pip install -r requirements.txt`, and start command is `uvicorn app.main:app --host 0.0.0.0 --port $PORT`.
+

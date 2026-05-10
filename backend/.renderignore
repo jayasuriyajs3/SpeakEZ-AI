@@ -1,0 +1,6 @@
+frontend/
+training/
+*.ipynb
+*.csv
+*.wav
+*.joblib

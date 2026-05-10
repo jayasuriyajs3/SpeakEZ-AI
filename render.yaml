@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: speakez-backend
+    env: python
+    plan: free
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: STORAGE_BACKEND
+        value: mongodb
+      - key: MONGODB_URI
+        sync: false
+      - key: MONGODB_DATABASE
+        value: speakez
+      - key: SPEAKEZ_STT_PROVIDER
+        value: local
