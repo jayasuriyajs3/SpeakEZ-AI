@@ -12,6 +12,7 @@ from app.mongo import get_mongo_db, get_next_sequence
 from app.settings import settings
 
 
+
 @dataclass
 class SessionRecord:
     id: int
